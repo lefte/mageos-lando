@@ -1,0 +1,13 @@
+; Allow load files from any folder, for fitment importing
+[mysqld]
+secure-file-priv=""
+local_infile=ON
+
+; Performance tests
+query_cache_type=1
+query_cache_size=10M
+query_cache_limit=256K
+
+[mysql]
+local_infile=ON
+

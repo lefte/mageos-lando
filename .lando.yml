@@ -1,0 +1,320 @@
+# Give this Lando project a unique name
+name: mageos
+
+# Start with the default LEMP recipe
+recipe: lemp
+
+proxy:
+  # Set Magento URL
+  appserver_nginx:
+    - mageos.lndo.site
+
+# Configure the LEMP recipe
+config:
+  php: "8.1"
+  webroot: pub
+  database: mariadb
+  composer_version: 2
+  xdebug: false
+
+  # Optionally mix in your own config files
+  # If ommitted this will use "sane defaults" for your recipe type
+  config:
+    vhosts: .lando/nginx/default.conf
+    php: .lando/php/php.ini
+    database: .lando/database/my-custom.cnf
+
+# Services needed by Magento
+services:
+  appserver:
+    # type: nginx:custom
+    # overrides:
+    # image: zcube/bitnami-compat-nginx:1.23-debian-11
+    build_as_root:
+      # This will only run the first time `lando start` is executed or on `lando rebuild`
+      # Install Magento-required extension: xsl, sockets
+      - apt-get update -y -q && apt-get install -y libxslt-dev ack lsof vim mc npm && docker-php-ext-install xsl sockets
+      # Install Grunt for LESS source map generation
+      - npm install -g grunt-cli
+      # Test
+      - mkdir -p /app/app/etc
+
+  redis:
+    type: redis:6.0
+    portforward: 6380
+    app_mount: disabled
+
+  elasticsearch:
+    type: elasticsearch:custom
+    portforward: 9200
+    plugins: [analysis-icu, analysis-phonetic]
+    overrides:
+      # Zcube packages are Macbook M1 and ARM-compatible
+      image: zcube/bitnami-compat-elasticsearch:7-debian-11
+      environment:
+        BITNAMI_DEBUG: "TRUE"
+        ELASTICSEARCH_IS_DEDICATED_NODE: "YES"
+        ELASTICSEARCH_NODE_TYPE: "master"
+        ES_JAVA_HOME: "/opt/bitnami/java"
+    config:
+      server: .lando/elasticsearch/my_elasticsearch.yml
+    app_mount: disabled
+
+  database:
+    type: mariadb:custom
+    overrides:
+      image: zcube/bitnami-compat-mariadb:10.8-debian-11
+    portforward: 3307
+    creds:
+      user: magento
+      password: magento
+      database: magento
+    # We only really need the database export files
+    app_mount: ro
+    run_as_root:
+      # Create VCDB database along side Magento and update fitment file load permissions
+      - mysql -uroot -e "CREATE DATABASE IF NOT EXISTS magento;"
+      - mysql -uroot -e "DROP USER 'magento'@'%'; CREATE USER 'magento'@'%' IDENTIFIED BY 'magento'; GRANT ALL PRIVILEGES ON *.* TO 'magento'@'%';"
+
+  rabbitmq:
+    type: compose
+    services:
+      image: "rabbitmq:3.8-management"
+      hostname: "rabbitmq"
+      ports:
+        - "15672:15672"
+        - "5672:5672"
+      command: rabbitmq-server
+      volumes:
+        - .lando/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.config
+      labels:
+        NAME: "rabbitmq"
+    app_mount: disabled
+
+events:
+  post-rebuild:
+    - elasticsearch:
+      # First command modifies the replica setting so ES turns green
+      # Next two allow full disk usage so the index doesn't complain
+      - |
+        curl -X PUT -H 'Content-Type: application/json' "http://127.0.0.1:9200/*/_settings" -d '{"index":{"number_of_replicas" : 0 }}';
+        curl -X PUT -H "Content-Type: application/json" "http://127.0.0.1:9200/_cluster/settings" -d '{ "transient": { "cluster.routing.allocation.disk.threshold_enabled": false } }';
+        curl -X PUT -H "Content-Type: application/json" "http://127.0.0.1:9200/_all/_settings" -d '{"index.blocks.read_only_allow_delete": null}';
+
+# If you want your local vendor directory to populate with libraries, (for code hinting)
+#   1. comment out the - vendor line below,
+#   2. run lando rebuild,
+#   3. run lando composer install,
+#   4. uncomment - vendor line below
+excludes:
+  - generated
+  - pub/static
+  - var
+  - "!var/log"
+  - "!var/report"
+  - vendor
+
+tooling:
+  npm:
+    description: Execute NPM commands
+    service: appserver
+    cmd:
+      - npm
+
+  grunt:
+    description: Execute Grunt commands
+    service: appserver
+    cmd:
+      - grunt
+
+  grunt:all:
+    description: Execute Grunt Exec and Less commands (Run all the things)
+    service: appserver
+    cmd:
+      - echo "^^^^ Generating Static Content"
+      - /app/n98-magerun2.phar setup:static-content:deploy -vv --force -s standard --language en_US --jobs 8 --theme Perficient/Backend --theme Perficient/Core --theme Perficient/Aries --theme Perficient/Curt --theme Perficient/Luverne --theme Perficient/Uws
+      - echo "^^^^ Running Grunt Exec"
+      - echo "^^^^ Running Grunt Exec"
+      - echo "^^^^ Running Grunt Exec"
+      - grunt exec
+      - echo "^^^^ Running Grunt Less"
+      - echo "^^^^ Running Grunt Less"
+      - echo "^^^^ Running Grunt Less"
+      - grunt less
+
+  n98:
+    description: Execute ./n98-magerun2.phar commands
+    service: appserver
+    cmd:
+      - /app/n98-magerun2.phar -v
+
+  magento:
+    description: Execute ./bin/magento commands
+    service: appserver
+    cmd: /app/bin/magento -v
+
+  magento:flush:
+    description: Clean and flush the Magento caches using n98
+    service: appserver
+    cmd:
+      - /app/n98-magerun2.phar c:clean
+      - /app/n98-magerun2.phar c:f
+
+  magento:install:
+    description: Install Magento
+    service: appserver
+    cmd:
+      - echo @@@@@ Phase One - Install N98
+      - wget -nc https://files.magerun.net/n98-magerun2.phar
+      - chmod +x n98-magerun2.phar
+      - /app/n98-magerun2.phar -v setup:install
+
+  magento:init:
+    description: Get the dev environment setup and configured for Magento development.
+    service: appserver
+    cmd:
+      - echo @@@@@ Phase One - Import Environment
+        # - cp /app/.lando/magento/dev-env.php /app/app/etc/env.php
+      - echo @@@@@ Phase Two - Clean Generated Code
+      - rm -rf /app/vendor/* /app/var/cache/* /app/var/page_cache/* /app/var/view_preprocessed/* /app/generated/code/*
+      - echo @@@@@ Phase Three - Composer Install
+        #- composer clearcache -v
+      - php /usr/local/bin/composer install -vvv
+      - echo @@@@@ Phase Four - Magento Setup Upgrade
+      - /app/bin/magento setup:upgrade -vvv
+      - echo @@@@@ Phase Five - Optimize caches
+      - php /usr/local/bin/composer dump-autoload --optimize --apcu -vv
+      - echo @@@@@ Phase Six - Install N98
+      - wget -nc https://files.magerun.net/n98-magerun2.phar
+      - chmod +x n98-magerun2.phar
+      - echo @@@@@ Set up npm Grunt
+      - npm install
+      - echo @@@@@ Magento Initialization Complete
+
+  magento:upgrade:
+    description: Run a Composer and Magento upgrade
+    service: appserver
+    cmd:
+      - echo @@@@@ Phase One - Import Environment
+        # - cp /app/.lando/magento/dev-env.php /app/app/etc/env.php
+      - echo @@@@@ Phase Two - Clean Generated Code
+      - rm -rf /app/vendor/* /app/var/cache/* /app/var/page_cache/* /app/var/view_preprocessed/* /app/generated/code/*
+      - echo @@@@@ Phase Three - Composer Upgrade
+      - php /usr/local/bin/composer upgrade -vvv
+      - echo @@@@@ Phase Four - Magento Setup Upgrade
+      - /app/bin/magento setup:upgrade -vvv
+      - echo @@@@@ Phase Five - Optimize caches
+      - php /usr/local/bin/composer dump-autoload --optimize --apcu -vv
+      - echo @@@@@ Phase Six - Install N98
+      - wget -nc https://files.magerun.net/n98-magerun2.phar
+      - chmod +x n98-magerun2.phar
+      - echo @@@@@ Magento Initialization Complete
+
+  magento:update-env:
+    description: Update the env.php file in the Lando app
+    service: appserver
+    cmd:
+      - echo ^^^^ Phase One - Copy env to the spot Magento expects it
+        # - cp /app/.lando/magento/dev-env.php /app/app/etc/env.php
+      - echo ^^^^ Phase Two - Run setup:upgrade to apply
+      - /app/bin/magento setup:upgrade -vvv
+      - echo ^^^^ Phase Three - Optimize caches
+      - php /usr/local/bin/composer dump-autoload --optimize --apcu -vv
+
+  magento:config-update:
+    description: Update config
+    service: appserver
+    cmd:
+      - echo ^^^^ Phase One - Copy env to the spot Magento expects it
+        # - cp /app/.lando/magento/dev-env.php /app/app/etc/env.php
+      - /app/bin/magento app:config:import
+      - echo ^^^^ Phase Two - Run setup:upgrade to apply
+      - /app/bin/magento setup:upgrade -vvv
+      - echo ^^^^ Phase Three - Optimize caches
+      - php /usr/local/bin/composer dump-autoload --optimize --apcu -vv
+
+  magento:autoload:
+    description: Run a Composer autoload generation
+    service: appserver
+    cmd:
+      - echo @@@@@ Phase Five - Optimize caches
+      - php /usr/local/bin/composer dump-autoload --optimize --apcu -vv
+
+  magento:clearcache:
+    description: Clear cache and flush using Magento
+    service: appserver
+    cmd:
+      - /app/bin/magento c:clean
+      - /app/bin/magento c:flush
+
+  magento:reindex:
+    description: Reindex
+    service: appserver
+    cmd:
+      - echo @@@@@ Reindex start
+      - /app/bin/magento index:reindex
+      - echo @@@@@ Reindex finish
+
+  magento:su:
+    description: Setup upgrade
+    service: appserver
+    cmd:
+#      - rm -rf /app/var/cache/* /app/generated/code/*
+#      - php /usr/local/bin/composer install
+#      - php /usr/local/bin/composer remove iwd/addressvalidation
+      - php /usr/local/bin/composer install
+      - echo @@@@@ Setup upgrade start
+#      - rm -rf var/cache/* && rm -rf var/page_cache/* && rm -rf generated/code/* && echo "@@@ Cleared Code"
+      - /app/bin/magento setup:upgrade -vvv
+#      - /app/bin/magento setup:di:compile
+#      - /app/bin/magento app:config:import
+#      - /app/bin/magento msp:security:tfa:disable
+#      - /app/bin/magento setup:upgrade -vvv
+#      - /app/bin/magento setup:static-content:deploy -f
+#      - /app/bin/magento admin:user:create --admin-user="fcanary-dev" --admin-password="123123Qa" --admin-email="admin+dev@fcanary.dev" --admin-firstname="Canary" --admin-lastname="Find"
+      - echo @@@@@ Setup upgrade finish
+
+  magento:clearcode:
+    description: Clear Generated Code
+    service: appserver
+    cmd:
+      - echo "Clearing generated code:"
+      - rm -rf var/cache/* && rm -rf var/page_cache/* && rm -rf generated/code/* && echo "@@@ Cleared Code"
+
+  magento:clearstatic:
+    description: Clear Static Content
+    service: appserver
+    cmd:
+      - echo "Clearing static content:"
+      - rm -rf pub/static/* && echo "@@@ Cleared Static" && rm -rf var/view_preprocessed/* && echo "@@@ Cleared Views"
+
+  magento:compile:
+    description: Run a DI Compile
+    service: appserver
+    cmd:
+      - echo ^^^^ Running DI Compile
+      - /app/n98-magerun2.phar setup:di:compile -vv
+
+  magento:static:
+    description: Generate Static Content
+    service: appserver
+    cmd:
+      - echo ^^^^ Generating Static Content
+      - /app/n98-magerun2.phar setup:static-content:deploy -vv --force -s standard --language en_US --jobs 4 --theme Perficient/Backend --theme Perficient/Core --theme Perficient/Aries --theme Perficient/Curt --theme Perficient/Luverne --theme Perficient/Uws
+
+  magento:fix-es-cluster:
+    description: Update the Elasticsearch cluster to turn it green
+    service: elasticsearch
+    cmd:
+      # First command modifies the replica setting so ES turns green
+      # Next two allow full disk usage so the index doesn't complain
+      - |
+        curl -X PUT -H 'Content-Type: application/json' "http://127.0.0.1:9200/*/_settings" -d '{"index":{"number_of_replicas" : 0 }}';
+        curl -X PUT -H "Content-Type: application/json" "http://127.0.0.1:9200/_cluster/settings" -d '{ "transient": { "cluster.routing.allocation.disk.threshold_enabled": false } }';
+        curl -X PUT -H "Content-Type: application/json" "http://127.0.0.1:9200/_all/_settings" -d '{"index.blocks.read_only_allow_delete": null}';
+
+  magento:setup:
+    description: Execute bin/magento setup:upgrade command
+    service: appserver
+    cmd: /app/bin/magento setup:upgrade -vvv
+

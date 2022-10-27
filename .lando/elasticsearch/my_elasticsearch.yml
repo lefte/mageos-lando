@@ -1,0 +1,17 @@
+http:
+  port: 9200
+path:
+  data: /bitnami/elasticsearch/data
+transport:
+  port: 9300
+network:
+  host: 0.0.0.0
+cluster:
+  name: bespin
+node:
+  name: lando
+  roles: [master, data]
+discovery:
+  type: single-node
+plugin:
+  mandatory: analysis-icu,analysis-phonetic
